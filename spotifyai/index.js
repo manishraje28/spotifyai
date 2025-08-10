@@ -8,6 +8,7 @@ import express from 'express';
 import axios from 'axios';
 import cors from 'cors';
 import 'dotenv/config'; // To load environment variables from a .env file
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 const app = express();
 const port = 8000; // Must match the port in your Redirect URI
@@ -19,7 +20,21 @@ const port = 8000; // Must match the port in your Redirect URI
 // REDIRECT_URI=http://127.0.0.1:8000/callback
 // GEMINI_API_KEY=your_gemini_api_key
 
-const { SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, REDIRECT_URI, GEMINI_API_KEY } = process.env;
+const { SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, REDIRECT_URI, GEMINI_API_KEY, GEMINI_MODEL } = process.env;
+const GEMINI_MODEL_NAME = GEMINI_MODEL || 'gemini-1.5-flash'; // default to free/cheaper model
+
+// Gemini client (only if key present)
+let genAI = null;
+if (GEMINI_API_KEY) {
+    try {
+        genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+        // lazy model fetch in function
+    } catch (e) {
+        console.warn('Failed to init Gemini client:', e.message);
+    }
+} else {
+    console.warn('GEMINI_API_KEY not set. AI command interpretation will use fallback heuristics.');
+}
 
 // --- Middleware ---
 app.use(cors()); // Enable Cross-Origin Resource Sharing
@@ -154,65 +169,122 @@ app.post('/command', async (req, res) => {
  * @returns {Promise<object>} A JSON object with 'action' and 'parameters'
  */
 async function getActionFromGemini(userCommand) {
-    const prompt = `
-        You are an expert assistant that translates natural language commands into structured JSON objects for the Spotify API.
-        Analyze the user's command and determine the correct action and any necessary parameters.
+    // If no Gemini key, immediately fallback to heuristic parsing.
+    if (!genAI) {
+        return heuristicInterpret(userCommand);
+    }
 
-        Your response MUST be a single, valid JSON object and nothing else.
+    const systemInstructions = `You translate natural language Spotify control commands into a compact JSON.
+Return ONLY JSON with: {"action": string, "parameters": object}.
+Allowed actions: play, pause, next, previous, search_and_play, play_artist_top_tracks, play_my_playlist.
+Rules: No commentary. No markdown fences. If searching, choose type among track, artist, playlist (best guess).
+`;
 
-        The possible actions are:
-        - "play": Resume playback.
-        - "pause": Pause playback.
-        - "next": Skip to the next track.
-        - "previous": Skip to the previous track.
-        - "search_and_play": Search for something and play the first result. Parameters: "query" (string), "type" (string, e.g., "track", "artist", "playlist").
-        - "play_artist_top_tracks": Find an artist and play their top songs. Parameters: "artistName" (string).
-        - "play_my_playlist": Finds and plays a playlist from the user's library. Parameters: "playlistName" (string).
+    const examples = [
+        { c: 'Pause the current song', j: { action: 'pause', parameters: {} } },
+        { c: 'Play the next track', j: { action: 'next', parameters: {} } },
+        { c: 'Search for a Lofi playlist and play it', j: { action: 'search_and_play', parameters: { query: 'Lofi', type: 'playlist' } } },
+        { c: 'Play something by Tame Impala', j: { action: 'search_and_play', parameters: { query: 'Tame Impala', type: 'artist' } } },
+        { c: 'Play the top songs by AR Rahman', j: { action: 'play_artist_top_tracks', parameters: { artistName: 'AR Rahman' } } },
+        { c: 'Play relaxing music', j: { action: 'search_and_play', parameters: { query: 'relaxing music', type: 'playlist' } } },
+        { c: 'Play the song Hotel California', j: { action: 'search_and_play', parameters: { query: 'Hotel California', type: 'track' } } },
+        { c: 'Play my workout playlist', j: { action: 'play_my_playlist', parameters: { playlistName: 'workout' } } }
+    ];
 
-        Here are some examples:
+    const prompt = [
+        systemInstructions,
+        ...examples.map(e => `Command: "${e.c}"
+${JSON.stringify(e.j)}`),
+        `Command: "${userCommand}"`
+    ].join('\n\n');
 
-        Command: "Pause the current song"
-        {"action": "pause", "parameters": {}}
+    try {
+        const model = genAI.getGenerativeModel({ model: GEMINI_MODEL_NAME });
+        const result = await model.generateContent(prompt);
+        const raw = (result?.response?.text() || '').trim();
+        const cleaned = raw
+            .replace(/^```json/i, '')
+            .replace(/^```/, '')
+            .replace(/```$/g, '')
+            .trim();
+        const parsed = safeJson(cleaned);
+        if (parsed && parsed.action) return sanitizeInterpretation(parsed);
+        // Attempt secondary extraction if model wrapped JSON in text
+        const extracted = extractJsonFromText(raw);
+        if (extracted && extracted.action) return sanitizeInterpretation(extracted);
+        return heuristicInterpret(userCommand);
+    } catch (err) {
+        const msg = (err && err.message) ? err.message.toLowerCase() : '';
+        if (msg.includes('429') || msg.includes('resource_exhausted') || msg.includes('quota')) {
+            console.warn('Gemini quota/rate limit hit. Falling back to heuristic interpretation.');
+        } else {
+            console.warn('Gemini error, using heuristic fallback:', err.message);
+        }
+        return heuristicInterpret(userCommand);
+    }
+}
 
-        Command: "Play the next track"
-        {"action": "next", "parameters": {}}
+function safeJson(str) {
+    try { return JSON.parse(str); } catch { return null; }
+}
 
-        Command: "Search for a Lofi playlist and play it"
-        {"action": "search_and_play", "parameters": {"query": "Lofi", "type": "playlist"}}
+function extractJsonFromText(text) {
+    const match = text.match(/\{[\s\S]*\}$/m);
+    if (!match) return null;
+    return safeJson(match[0]);
+}
 
-        Command: "Play something by Tame Impala"
-        {"action": "search_and_play", "parameters": {"query": "Tame Impala", "type": "artist"}}
+function sanitizeInterpretation(obj) {
+    const allowed = new Set(['play','pause','next','previous','search_and_play','play_artist_top_tracks','play_my_playlist']);
+    if (!allowed.has(obj.action)) return { action: 'play', parameters: {} };
+    // Basic parameter whitelisting
+    const p = obj.parameters || {};
+    switch (obj.action) {
+        case 'search_and_play':
+            return { action: obj.action, parameters: { query: String(p.query || '' ).slice(0,120), type: pickType(p.type) } };
+        case 'play_artist_top_tracks':
+            return { action: obj.action, parameters: { artistName: String(p.artistName || p.artist || '').slice(0,80) } };
+        case 'play_my_playlist':
+            return { action: obj.action, parameters: { playlistName: String(p.playlistName || p.name || '').slice(0,80) } };
+        default:
+            return { action: obj.action, parameters: {} };
+    }
+}
 
-        Command: "Play the top songs by AR Rahman"
-        {"action": "play_artist_top_tracks", "parameters": {"artistName": "AR Rahman"}}
+function pickType(t) {
+    const allowed = ['track','artist','playlist'];
+    if (allowed.includes(t)) return t;
+    return 'track';
+}
 
-        Command: "Play relaxing music"
-        {"action": "search_and_play", "parameters": {"query": "relaxing music", "type": "playlist"}}
-
-        Command: "Play the song Hotel California"
-        {"action": "search_and_play", "parameters": {"query": "Hotel California", "type": "track"}}
-
-        Command: "Play my workout playlist"
-        {"action": "play_my_playlist", "parameters": {"playlistName": "workout"}}
-
-        Now, analyze this command:
-        Command: "${userCommand}"
-    `;
-    
-    // ***UPDATED***: Switched back to gemini-1.5-flash to avoid rate limits.
-    const geminiApiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${GEMINI_API_KEY}`;
-    
-    const response = await axios.post(geminiApiUrl, {
-        contents: [{ parts: [{ text: prompt }] }]
-    });
-
-    // Extract and clean the JSON string from Gemini's response
-    const jsonString = response.data.candidates[0].content.parts[0].text
-        .replace(/```json/g, '')
-        .replace(/```/g, '')
-        .trim();
-        
-    return JSON.parse(jsonString);
+// Heuristic fallback if AI unavailable or fails
+function heuristicInterpret(command) {
+    const c = command.toLowerCase();
+    if (/pause|stop/.test(c)) return { action: 'pause', parameters: {} };
+    if (/next|skip/.test(c)) return { action: 'next', parameters: {} };
+    if (/previous|back/.test(c)) return { action: 'previous', parameters: {} };
+    if (/play (my )?\w+ playlist/.test(c)) {
+        const m = c.match(/play (?:my )?(.+?) playlist/);
+        if (m) return { action: 'play_my_playlist', parameters: { playlistName: m[1].trim() } };
+    }
+    if (/top songs by|top tracks by|play top songs of/.test(c)) {
+        const m = c.match(/(?:by|of) (.+)$/);
+        if (m) return { action: 'play_artist_top_tracks', parameters: { artistName: m[1].trim() } };
+    }
+    if (/play /.test(c)) {
+        // Attempt to extract after 'play'
+        const m = c.match(/play (.+)/);
+        if (m) {
+            const query = m[1].replace(/^(the )/, '').trim();
+            // Guess type by simple keywords
+            let type = 'track';
+            if (/playlist/.test(query)) type = 'playlist';
+            else if (/ by /.test(query)) type = 'track';
+            return { action: 'search_and_play', parameters: { query: query.replace(/ playlist/, ''), type } };
+        }
+    }
+    // Default generic
+    return { action: 'play', parameters: {} };
 }
 
 

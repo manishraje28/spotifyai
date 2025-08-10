@@ -1,0 +1,27 @@
+### Root-level ignore file (applies to entire repo)
+# Ignore any root install artifacts accidentally created
+/node_modules/
+/.env
+/.env.*
+/package-lock.json
+
+# Logs
+*.log
+/logs
+
+# OS / Editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Build outputs (if any at root)
+/dist/
+
+# Prevent ignoring the real project files inside spotifyai
+!spotifyai/package.json
+!spotifyai/package-lock.json
+
+# If you intentionally add a root package.json later, adjust ignores accordingly
